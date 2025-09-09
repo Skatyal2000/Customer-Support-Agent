@@ -7,8 +7,11 @@ import pandas as pd  # for loading parquet
 import faiss  # for vector index
 from sentence_transformers import SentenceTransformer  # for embeddings
 from rapidfuzz import process, fuzz  # for fuzzy matching
+import smtplib  # for email
+from email.mime.text import MIMEText  # email body
 import json  # for writing json lines
 from datetime import timedelta 
+import requests
 
 
 # load faiss index and metadata when the file is imported
@@ -17,6 +20,15 @@ META_PATH = "index/orders_meta.parquet"  # path to meta parquet file
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # embedding model
 KB_INDEX_PATH = "kb_index/kb.faiss"  # path to kb faiss file
 KB_META_PATH = "kb_index/kb_meta.parquet"  # path to kb meta file
+ORDERS_CSV = os.getenv("ORDERS_CSV_PATH", "data/olist_cleaned.csv")  # csv path
+_ORDERS_DF = None  # cache for the dataframe
+
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")  # slack incoming webhook url
+SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "")  # destination email for escalations
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
 
 FAISS = None  # variable to hold the faiss index
 META = None  # variable to hold metadata dataframe
@@ -131,17 +143,6 @@ def start_return(order_id, reason, rma_prefix="RMA"):
     _write_jsonl("logs/actions.jsonl", rec)  # log to actions file
     return {"rma_id": rma_id, "status": "initiated", "reason": reason}  # return result
 
-def escalate_to_human(order_id, issue, context=None):
-    # this function writes a handoff record for a human to review
-    payload = {
-        "type": "handoff",
-        "order_id": order_id,
-        "issue": issue,
-        "context": context or {},
-        "status": "awaiting_human"
-    }  # make record
-    _write_jsonl("logs/handoffs.jsonl", payload)  # log to handoffs file
-    return {"handoff": True, "status": "awaiting_human", "issue": issue}  # return summary
 
 def cancel_order(order_id, reason):
     # this function mocks a cancel request
@@ -205,6 +206,32 @@ def kb_search(query, k=6):
     hits = KB_META.iloc[I[0]].to_dict(orient="records")  # pick rows
     return hits  # return list of dicts (includes 'text', 'title', 'source', 'page')
 
+def _load_orders_df():
+    # this function loads the orders csv once into memory
+    global _ORDERS_DF 
+    if _ORDERS_DF is None:
+        _ORDERS_DF = pd.read_csv(ORDERS_CSV)
+        if "purchase_date" in _ORDERS_DF.columns:
+            _ORDERS_DF["purchase_date"] = pd.to_datetime(_ORDERS_DF["purchase_date"], errors="coerce")
+    return _ORDERS_DF  # return the dataframe
+
+def get_orders_by_email(email: str, limit: int = 10):
+    # this function returns up to 'limit' most recent orders for an email
+    df = _load_orders_df()  
+    if "customer_email" not in df.columns:
+        return []
+    
+    mask = df["customer_email"].astype(str).str.lower() == str(email).lower()
+    # sort by purchase_date desc if exists, else leave order
+    if "purchase_date" in df.columns:
+        rows = df.loc[mask].sort_values("purchase_date", ascending=False).head(limit)
+    else:
+        rows = df.loc[mask].head(limit)
+    return rows.to_dict(orient="records")
+
+def first_order_facts(orders: list) -> dict | None:
+    return orders[0] if orders else None
+
 def create_ticket(order_id, issue):
     # this function mocks a support ticket creation
     return {
@@ -212,3 +239,54 @@ def create_ticket(order_id, issue):
         "status": "open",  # mark status as open
         "issue": issue,  # copy issue
     }
+
+def notify_human_slack(payload: dict) -> bool:
+    # this function posts a payload to slack webhook
+    if not SLACK_WEBHOOK_URL:
+        return False
+    try:
+        text = "*New Support Handoff*\n```" + json.dumps(payload, indent=2) + "```"
+        r = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
+    
+def notify_human_email(payload: dict) -> bool:
+    # this function emails the payload to SUPPORT_EMAIL
+    if not (SUPPORT_EMAIL and SMTP_HOST and SMTP_USER and SMTP_PASS):
+        return False
+    try:
+        body = json.dumps(payload, indent=2)
+        msg = MIMEText(body)
+        msg["Subject"] = "New Support Handoff"
+        msg["From"] = SMTP_USER
+        msg["To"] = SUPPORT_EMAIL
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, [SUPPORT_EMAIL], msg.as_string())
+        return True
+    except Exception:
+        return False
+    
+def escalate_to_human(order_id: str, issue: str, extra: dict = None) -> dict:
+    # this function logs a handoff and notifies slack/email if configured
+    rec = {
+        "handoff": True,
+        "status": "awaiting_human",
+        "order_id": order_id or None,
+        "issue": issue,
+        "extra": extra or {},
+    }  # build record
+
+    os.makedirs("logs", exist_ok=True)  # make logs dir
+    with open("logs/handoffs.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")  # write line
+
+    ok_slack = notify_human_slack(rec)  # try slack
+    ok_email = notify_human_email(rec)  # try email
+
+    rec["notified_slack"] = ok_slack  # record flags
+    rec["notified_email"] = ok_email
+
+    return rec  # return record so compose can show it

@@ -52,75 +52,6 @@ def build_prompt(user_input, facts, hits):
     return prompt  # return the prompt string
 
 
-
-def generate_answer(user_input, facts=None, hits=None):
-    # this function calls ollama /api/generate and returns the text answer
-    prompt = build_prompt(user_input, facts, hits)  # build the prompt string
-
-    # read model and url from env, with defaults
-    model = os.getenv("LOCAL_LLM_NAME", "llama3:instruct")  # ollama model name
-    url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")  # ollama endpoint
-
-    # read generation options from env
-    num_predict = int(os.getenv("OLLAMA_NUM_PREDICT", "200"))  # limit tokens
-    temperature = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))  # sampling temp
-    num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "2048"))  # context tokens
-    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "10m")  # keep model loaded
-    timeout_sec = int(os.getenv("OLLAMA_TIMEOUT_SEC", "60"))  # http timeout
-
-    payload = {
-        "model": model,  # which model to use
-        "prompt": prompt,  # the prompt text
-        "stream": False,  # disable streaming for simplicity
-        "keep_alive": keep_alive,  # keep model in memory
-        "options": {  # fine-tune speed/quality
-            "num_predict": num_predict,
-            "temperature": temperature,
-            "num_ctx": num_ctx
-        }
-    }  # request payload
-
-    try:
-        resp = requests.post(url, json=payload, timeout=timeout_sec)  # post to ollama api
-        if resp.status_code == 404:
-            return (
-                "Ollama returned 404. Possible causes:\n"
-                f"- Wrong URL: {url}\n"
-                f"- Model not found: {model}\n"
-                "Try: `curl http://localhost:11434/api/tags` to see installed models and set LOCAL_LLM_NAME accordingly."
-            )
-        resp.raise_for_status()  # raise error for bad responses
-        data = resp.json()  # parse json
-        return (data.get("response") or "").strip()  # return model text
-    except requests.exceptions.ReadTimeout:
-        return "The local model took too long to respond. Try a smaller model or lower OLLAMA_NUM_PREDICT."
-    except requests.exceptions.ConnectionError:
-        return "Could not connect to Ollama. Is the server running and the URL correct?"
-    except Exception as e:
-        return f"Sorry, I could not reach the local model: {e}"
-    
-
-def generate_answer_timed(user_input, facts=None, hits=None):
-    # this function measures how long the model takes to answer
-    t0 = time.perf_counter()  # start timer
-    text = generate_answer(user_input, facts=facts, hits=hits)  # call main function
-    t1 = time.perf_counter()  # end timer
-    ms = int((t1 - t0) * 1000)  # compute milliseconds
-    return text, ms  # return both text and latency
-
-
-def _extract_json(text):
-    # this function tries to extract the first json object from a string
-    t = (text or "").strip()
-    if t.startswith("{") and t.endswith("}"):
-        return t
-    # naive scan for a {...} block
-    i = t.find("{"); j = t.rfind("}")
-    if i != -1 and j != -1 and j > i:
-        return t[i:j+1]
-    return "{}"  # fallback to empty json
-
-
 def nlu_classify(user_text, memory=None):
     # this function asks the model to output only json with intent and slots
     mem = memory or {}  # memory dict or empty
@@ -189,3 +120,69 @@ def nlu_classify(user_text, memory=None):
         if any(w in t for w in ["payment", "pay", "installment"]):
             return {"intent": "payment", "slots": {}, "yes_no": None}
         return {"intent": "general", "slots": {}, "yes_no": None}
+
+def _extract_json(text):
+    # this function tries to extract the first json object from a string
+    t = (text or "").strip()
+    if t.startswith("{") and t.endswith("}"):
+        return t
+    # naive scan for a {...} block
+    i = t.find("{"); j = t.rfind("}")
+    if i != -1 and j != -1 and j > i:
+        return t[i:j+1]
+    return "{}"  # fallback to empty json
+
+def generate_answer(user_input, facts=None, hits=None):
+    # this function calls ollama /api/generate and returns the text answer
+    prompt = build_prompt(user_input, facts, hits)  # build the prompt string
+
+    # read model and url from env, with defaults
+    model = os.getenv("LOCAL_LLM_NAME", "llama3:instruct")  # ollama model name
+    url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")  # ollama endpoint
+
+    # read generation options from env
+    num_predict = int(os.getenv("OLLAMA_NUM_PREDICT", "200"))  # limit tokens
+    temperature = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))  # sampling temp
+    num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "2048"))  # context tokens
+    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "10m")  # keep model loaded
+    timeout_sec = int(os.getenv("OLLAMA_TIMEOUT_SEC", "60"))  # http timeout
+
+    payload = {
+        "model": model,  # which model to use
+        "prompt": prompt,  # the prompt text
+        "stream": False,  # disable streaming for simplicity
+        "keep_alive": keep_alive,  # keep model in memory
+        "options": {  # fine-tune speed/quality
+            "num_predict": num_predict,
+            "temperature": temperature,
+            "num_ctx": num_ctx
+        }
+    }  # request payload
+
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout_sec)  # post to ollama api
+        if resp.status_code == 404:
+            return (
+                "Ollama returned 404. Possible causes:\n"
+                f"- Wrong URL: {url}\n"
+                f"- Model not found: {model}\n"
+                "Try: `curl http://localhost:11434/api/tags` to see installed models and set LOCAL_LLM_NAME accordingly."
+            )
+        resp.raise_for_status()  # raise error for bad responses
+        data = resp.json()  # parse json
+        return (data.get("response") or "").strip()  # return model text
+    except requests.exceptions.ReadTimeout:
+        return "The local model took too long to respond. Try a smaller model or lower OLLAMA_NUM_PREDICT."
+    except requests.exceptions.ConnectionError:
+        return "Could not connect to Ollama. Is the server running and the URL correct?"
+    except Exception as e:
+        return f"Sorry, I could not reach the local model: {e}"
+    
+
+def generate_answer_timed(user_input, facts=None, hits=None):
+    # this function measures how long the model takes to answer
+    t0 = time.perf_counter()  # start timer
+    text = generate_answer(user_input, facts=facts, hits=hits)  # call main function
+    t1 = time.perf_counter()  # end timer
+    ms = int((t1 - t0) * 1000)  # compute milliseconds
+    return text, ms  # return both text and latency

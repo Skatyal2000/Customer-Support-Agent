@@ -7,6 +7,9 @@ import re  # for regex simple checks
 import agent  # import the helper tools file (agent.py)
 import llm  # for the model call (compose step)
 
+AUTO_ESCALATE_ON = True       # turn auto-handoff on/off
+MAX_REPEAT_INTENT = 2         # how many repeated intents before handoff
+MAX_NO_FACTS = 2              # how many turns with no order facts before handoff
 
 class GraphState(TypedDict, total=False):
     # this class defines the keys we keep in the graph state
@@ -51,7 +54,7 @@ def classify(state: GraphState) -> Dict[str, Any]:
 
 
 
-def retrieve(state):
+def retrieve(state): #RAG Search
     q = state.get("input", "")  # query
     order_hits = agent.rag_search(q, k=6)  # order/review search
     kb_hits = agent.kb_search(q, k=6)  # kb search
@@ -60,191 +63,271 @@ def retrieve(state):
 
 
 def resolve_facts(state: GraphState) -> Dict[str, Any]:
-    # this function tries to resolve an order using query or memory
-    q = state.get("input", "")  # get query text
-    mem = dict(state.get("memory", {}))  # copy memory dict so we can update it
-    orders = []  # list to store multiple orders for email lookups
-    facts = None  # this will store one chosen order facts
+    # this function tries to resolve an order using query, memory, or rag
+    q = state.get("input", "")  # user text
+    mem = dict(state.get("memory", {}))  # copy memory to update
+    orders = []  # list for email path (multi orders)
+    facts = None  # chosen order facts
 
-    # try to parse email from the query
-    email_match = re.search(r"[\w\.-]+@[\w\.-]+", q, flags=re.I)  # find an email pattern
+    # 1) try to parse email from the query (exact email lookup)
+    email_match = re.search(r"[\w\.-]+@[\w\.-]+", q, flags=re.I)
     if email_match:
-        email = email_match.group(0)  # extract email text
-        mem["current_email"] = email  # remember last seen email
+        email = email_match.group(0)
+        mem["current_email"] = email
         try:
-            # this helper exists if you added it earlier; if not, it will just not run
-            orders = agent.get_orders_by_email(email, limit=10)  # get orders for this email
+            orders = agent.get_orders_by_email(email, limit=10)  # exact from csv
         except Exception:
-            orders = []  # if helper not present or fails, keep empty
-
+            orders = []
         if orders:
-            # if we found orders, pick the first one as current context
             facts = agent.first_order_facts(orders) if hasattr(agent, "first_order_facts") else dict(orders[0])
-            if "order_id" in facts:
-                mem["current_order_id"] = facts["order_id"]  # remember current order id
+            if facts and "order_id" in facts:
+                mem["current_order_id"] = facts["order_id"]
 
-    # if we still have no facts, try to detect an order id from the query
+    # 2) if still no facts, try fuzzy order id from text (typo-tolerant id)
     if not facts:
-        order_id_from_text = agent.fuzzy_find_order_id(q)  # find order id by fuzzy
-        if order_id_from_text:
-            facts = agent.get_order_facts(order_id_from_text)  # get facts for that id
+        oid_txt = agent.fuzzy_find_order_id(q)
+        if oid_txt:
+            facts = agent.get_order_facts(oid_txt)
             if facts and "order_id" in facts:
-                mem["current_order_id"] = facts["order_id"]  # remember it
+                mem["current_order_id"] = facts["order_id"]
 
-    # if still nothing, try to use the last known order id from memory
+    # 3) if still no facts, try memory from previous turns (same order)
     if not facts and "current_order_id" in mem:
-        facts = agent.get_order_facts(mem["current_order_id"])  # reuse previous order id
+        facts = agent.get_order_facts(mem["current_order_id"])
 
-    # as a last fallback, use the first RAG hit's order_id (if present)
+    # 4) if still no facts AND we have rag hits, use first hit's order_id
     if not facts and state.get("hits"):
-        first_hit = state["hits"][0]  # take first hit
-        oid = first_hit.get("order_id")  # extract order id
+        first_hit = state["hits"][0]
+        oid = first_hit.get("order_id")
         if oid:
-            facts = agent.get_order_facts(oid)  # get facts
+            facts = agent.get_order_facts(oid)
             if facts and "order_id" in facts:
-                mem["current_order_id"] = facts["order_id"]  # remember it
+                mem["current_order_id"] = facts["order_id"]
 
-    # return facts, any found orders list, and the updated memory
-    return {"order_facts": facts, "orders": orders, "memory": mem}
+    return {"order_facts": facts, "orders": orders, "memory": mem}  # return results
+
 
 
 def policy_and_actions(state: GraphState) -> Dict[str, Any]:
-    # this function decides if any actions are needed like escalate, return, refund, cancel
-    facts = state.get("order_facts")  # get order facts
-    intent = (state.get("intent") or "").lower()  # get intent
-    actions = []  # list for actions
+    # this function decides business actions using facts + intent
+    facts = state.get("order_facts")
+    intent = (state.get("intent") or "").lower()
+    actions = list(state.get("actions", []))  # copy so we append safely
 
     if not facts:
-        return {"actions": actions}  # if no facts, nothing to do
+        return {"actions": actions}  # nothing to do without an order
 
-    oid = facts.get("order_id")  # order id string
-    status = str(facts.get("order_status", "")).lower()  # status text
+    oid = facts.get("order_id")
+    status = str(facts.get("order_status", "")).lower()
 
-    # always open tickets for SLA or low review (as before)
+    # auto tickets (examples)
     if facts.get("low_review"):
-        actions.append(agent.create_ticket(oid, "low review complaint"))  # escalate ticket
+        actions.append(agent.create_ticket(oid, "low review complaint"))
     if facts.get("is_delayed"):
-        actions.append(agent.create_ticket(oid, "late delivery"))  # escalate ticket
+        actions.append(agent.create_ticket(oid, "late delivery"))
 
-    # handle cancel requests (pre-delivery)
-    if intent in {"cancel"}:
+    # cancel (pre-delivery)
+    if intent == "cancel":
         if status in {"created", "approved", "processing", "shipped"}:
-            actions.append(agent.cancel_order(oid, "user requested cancel"))  # request cancel
+            actions.append(agent.cancel_order(oid, "user requested cancel"))
         else:
-            # if already delivered, escalate to human
             actions.append(agent.escalate_to_human(oid, "cancel after delivery not supported", {"status": status}))
-        return {"actions": actions}  # return after handling cancel
+        return {"actions": actions}
 
-    # handle refund/return requests (post-delivery)
+    # refund/return (post-delivery)
     if intent in {"refund", "return"}:
-        elig = agent.check_return_eligibility(facts, window_days=30)  # check window
+        elig = agent.check_return_eligibility(facts, window_days=30)
         if elig.get("eligible"):
-            actions.append(agent.start_return(oid, f"user requested {intent}"))  # start return
+            actions.append(agent.start_return(oid, f"user requested {intent}"))
         else:
-            # not eligible → handoff to human for discretion
             actions.append(agent.escalate_to_human(oid, f"{intent} not eligible", {"eligibility": elig}))
-        return {"actions": actions}  # return after handling return/refund
+        return {"actions": actions}
 
-    return {"actions": actions}  # default return
+    return {"actions": actions}  # default: no extra actions
+
+def supervise_and_escalate(state: GraphState) -> Dict[str, Any]:
+    # this function detects loops and triggers automatic handoff
+    mem = dict(state.get("memory", {}))  # copy memory
+    actions = list(state.get("actions", []))  # copy actions
+
+    intent = (state.get("intent") or "").lower()
+    has_facts = bool(state.get("order_facts"))
+
+    sc = dict(mem.get("stuck_counts", {}))  # counters
+    sc.setdefault("repeat_intent", 0)
+    sc.setdefault("no_facts", 0)
+
+    last_intent = mem.get("last_intent", "")
+    took_action = len(actions) > 0
+
+    # track repeats
+    if intent and last_intent and intent == last_intent and not took_action:
+        sc["repeat_intent"] += 1
+    else:
+        sc["repeat_intent"] = 0
+
+    # track no-facts on order-required intents
+    if intent in {"track", "payment", "refund", "return", "cancel"} and not has_facts:
+        sc["no_facts"] += 1
+    else:
+        sc["no_facts"] = 0
+
+    should_auto = AUTO_ESCALATE_ON and (sc["repeat_intent"] >= MAX_REPEAT_INTENT or sc["no_facts"] >= MAX_NO_FACTS)
+    if should_auto:
+        oid = state.get("order_facts", {}).get("order_id") if state.get("order_facts") else None
+        issue = "conversation stuck (repeat/no-facts)"
+        extra = {
+            "intent": intent,
+            "repeat_intent": sc["repeat_intent"],
+            "no_facts": sc["no_facts"],
+            "current_email": mem.get("current_email"),
+            "current_order_id": mem.get("current_order_id"),
+        }
+        hand = agent.escalate_to_human(oid or "", issue, extra)  # notify/log
+        actions.append(hand)
+        mem["auto_handoff"] = True
+        mem.pop("pending_handoff", None)
+        sc["repeat_intent"] = 0
+        sc["no_facts"] = 0
+
+    mem["stuck_counts"] = sc
+    if intent:
+        mem["last_intent"] = intent
+
+    return {"actions": actions, "memory": mem}
+
 
 def compose(state: GraphState) -> Dict[str, Any]:
-    # this function creates the final reply text (uses kb if no order facts)
+    # this function creates the final reply text
     user_q = state.get("input", "")  # user question text
-    facts = state.get("order_facts")  # selected order facts (may be None)
-    hits = state.get("hits", [])  # top order/review chunks
-    kb_hits = state.get("kb_hits", [])  # top kb/policy chunks
-    timings_prev = state.get("timings", {})  # timings from earlier steps
+    facts = state.get("order_facts")  # chosen order facts
+    hits = state.get("hits", [])  # order/review hits
+    kb_hits = state.get("kb_hits", [])  # kb hits
+    timings_prev = state.get("timings", {})  # timings so far
+    mem = state.get("memory", {})  # memory dict
 
-    # 1) if we have an email query with multiple orders, list a few recent ones
-    orders = state.get("orders", [])  # list of order rows when user gave email
+    # 0) show clear message if auto-handoff happened
+    if mem.get("auto_handoff"):
+        acts = state.get("actions", [])
+        hand = next((a for a in acts if isinstance(a, dict) and a.get("handoff")), None)
+        case_id = hand.get("order_id", "") if hand else ""
+        notified = []
+        if hand and hand.get("notified_slack"): notified.append("Slack")
+        if hand and hand.get("notified_email"): notified.append("email")
+        note = " and ".join(notified) if notified else "log"
+        lines = ["I'm handing this conversation to a human specialist so you get faster help."]
+        if case_id: lines.append(f"Reference ID: {case_id}")
+        lines.append(f"(notification sent via {note})")
+        return {"output": "\n".join(lines), "timings": timings_prev}
+
+    # 1) if multiple orders were found (email path), list a few
+    orders = state.get("orders", [])
     if orders:
-        lines = []  # list of lines to print
+        lines = []
         first = orders[0] if len(orders) > 0 else {}
         lines.append(
             f"Found {len(orders)} orders for "
             f"{first.get('first_name','')} {first.get('last_name','')} "
             f"<{first.get('customer_email','')}>"
-        )  # header line
-        lines.append("")  # blank line
-        lines.append("Most recent orders:")  # section title
-        for r in orders[:5]:  # show top 5
+        )
+        lines.append("")
+        lines.append("Most recent orders:")
+        for r in orders[:5]:
             pid = r.get("purchase_date", "")
             if hasattr(pid, "strftime"):
-                pid = pid.strftime("%Y-%m-%d")  # format date if datetime
+                pid = pid.strftime("%Y-%m-%d")
             lines.append(
                 f"- {r.get('order_id','')} | {r.get('order_status','')} | {pid} | "
                 f"{r.get('total_payment','')} via {r.get('payment_type','')} | "
                 f"items={r.get('num_items','')} | review={r.get('review_score','')}"
             )
-        return {"output": "\n".join(lines), "timings": timings_prev}  # return list summary
+        return {"output": "\n".join(lines), "timings": timings_prev}
 
-    # 2) if we don’t have an order but do have KB hits, answer from KB
+    # 2) kb-only answer if no order facts but we have kb hits
     if not facts and kb_hits:
-        snippets = []  # small list of kb snippets
+        snippets = []
         for h in kb_hits[:3]:
             txt = (h.get("text") or "").strip().replace("\n", " ")
-            if len(txt) > 400:
-                txt = txt[:400] + "..."  # trim long text
-            src = h.get("source", "")
+            if len(txt) > 400: txt = txt[:400] + "..."
+            src = h.get("source", "kb")
             page = h.get("page", None)
             tag = f"{src}" + (f" p.{page}" if page else "")
-            snippets.append(f"[{tag}] {txt}")  # add labeled snippet
-        kb_context = "\n".join(snippets)  # join snippets
+            snippets.append(f"[{tag}] {txt}")
         prompt = (
             f"{user_q}\n\n"
             "Use the following knowledge snippets to answer. Do not invent facts.\n"
-            f"{kb_context}\n\n"
-            "Answer succinctly and cite files inline like [filename p.X] when relevant."
-        )  # build a kb prompt
-        answer_text, gen_ms = llm.generate_answer_timed(prompt, facts={"order_id": "KB-ONLY"}, hits=[])  # call model
-        timings = dict(timings_prev); timings["generation_ms"] = gen_ms  # keep timings
+            + "\n".join(snippets)
+            + "\n\nAnswer succinctly and cite files inline like [filename p.X] when relevant."
+        )
+        answer_text, gen_ms = llm.generate_answer_timed(prompt, facts={"order_id": "KB-ONLY"}, hits=[])
+        timings = dict(timings_prev); timings["generation_ms"] = gen_ms
         if "retrieve_ms" in timings:
-            try:
-                timings["total_ms"] = int(timings.get("retrieve_ms", 0)) + int(gen_ms)  # total latency
-            except Exception:
-                pass  # ignore if types mismatch
-        return {"output": answer_text, "timings": timings}  # return kb answer
+            try: timings["total_ms"] = int(timings.get("retrieve_ms", 0)) + int(gen_ms)
+            except Exception: pass
+        return {"output": answer_text, "timings": timings}
 
-    # 3) if still no facts, ask for order id/email
+    # 3) ask for identifiers if still no facts
     if not facts:
         return {"output": "I could not find your order. Please share your order id or the email used for purchase."}
 
-    # 4) normal order-answer path (we have facts)
-    answer_text, gen_ms = llm.generate_answer_timed(user_q, facts=facts, hits=hits)  # call model
-    timings = dict(timings_prev); timings["generation_ms"] = gen_ms  # update timings
+    # 4) grounded single-order answer using facts (+ optional hits)
+    answer_text, gen_ms = llm.generate_answer_timed(user_q, facts=facts, hits=hits)
+    timings = dict(timings_prev); timings["generation_ms"] = gen_ms
     if "retrieve_ms" in timings:
-        try:
-            timings["total_ms"] = int(timings.get("retrieve_ms", 0)) + int(gen_ms)  # compute total
-        except Exception:
-            pass  # ignore casting issues
+        try: timings["total_ms"] = int(timings.get("retrieve_ms", 0)) + int(gen_ms)
+        except Exception: pass
 
-    # 5) append actions (tickets/RMA/cancel/handoff) if any ran
+    # 5) append any actions we took
     acts = state.get("actions", [])
     if acts:
         lines = [answer_text, "", "Actions taken:"]
-        for a in acts:
-            lines.append(str(a))  # show each action as a line
-        return {"output": "\n".join(lines), "timings": timings}  # return answer + actions
+        for a in acts: lines.append(str(a))
+        return {"output": "\n".join(lines), "timings": timings}
 
-    # 6) no actions, just return the plain answer
-    return {"output": answer_text, "timings": timings}  # final result
+    # 6) otherwise just return the answer
+    return {"output": answer_text, "timings": timings}
 
 
+
+
+def route_after_resolve_1(state: GraphState) -> str:
+    # this function chooses where to go after first resolve
+    return "policy_and_actions" if state.get("order_facts") else "retrieve"
+
+def route_after_resolve_2(state: GraphState) -> str:
+    # this function chooses where to go after second resolve
+    return "policy_and_actions" if state.get("order_facts") else "supervise_and_escalate"
 
 
 # now build the graph with a state schema
-graph = StateGraph(GraphState)  # make graph with schema
-graph.add_node("classify", classify)  # add classify node
-graph.add_node("retrieve", retrieve)  # add retrieve node
-graph.add_node("resolve_facts", resolve_facts)  # add resolve facts node
-graph.add_node("policy_and_actions", policy_and_actions)  # add policy node
-graph.add_node("compose", compose)  # add compose node
+graph = StateGraph(GraphState)                         
+graph.add_node("classify", classify)                   
+graph.add_node("retrieve", retrieve)                   
+graph.add_node("resolve_facts", resolve_facts)        
+graph.add_node("resolve_facts_2", resolve_facts)       
+graph.add_node("policy_and_actions", policy_and_actions)  
+graph.add_node("supervise_and_escalate", supervise_and_escalate)  
+graph.add_node("compose", compose)
 
-graph.set_entry_point("classify")  # set entry node
-graph.add_edge("classify", "retrieve")  # after classify go to retrieve
-graph.add_edge("retrieve", "resolve_facts")  # after retrieve go to resolve
-graph.add_edge("resolve_facts", "policy_and_actions")  # after resolve go to policy
-graph.add_edge("policy_and_actions", "compose")  # after policy go to compose
-graph.add_edge("compose", END)  # compose is the last step
 
-APP = graph.compile()  # compile the graph into app
+
+graph.set_entry_point("classify")                      # start at classify
+graph.add_edge("classify", "resolve_facts")            # go to resolve first
+
+# after first resolve → either policy (have facts) or retrieve (no facts)
+graph.add_conditional_edges("resolve_facts", route_after_resolve_1)
+
+# if we went to retrieve, then we run a second resolve
+graph.add_edge("retrieve", "resolve_facts_2")
+
+# after second resolve → either policy (have facts) or supervisor (still none)
+graph.add_conditional_edges("resolve_facts_2", route_after_resolve_2)
+
+# after policy we always run supervisor, then compose
+graph.add_edge("policy_and_actions", "supervise_and_escalate")
+graph.add_edge("supervise_and_escalate", "compose")
+
+# compose is last
+graph.add_edge("compose", END)
+
+APP = graph.compile()  # compile the graph into an app
