@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.vscode
+.streamlit/
+data/
+index/
+kb_index/
+logs/
+.DS_Store
+**/Archive (5).zip
+*.zip

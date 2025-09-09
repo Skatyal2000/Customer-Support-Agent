@@ -1,0 +1,22 @@
+# core data handling
+pandas
+numpy
+
+#core
+requests
+python-dotenv
+PyPDF2
+# embeddings and vector index
+sentence-transformers
+faiss-cpu
+
+# fuzzy search
+rapidfuzz
+
+# app and ui
+streamlit
+langgraph
+langchain
+
+# file formats
+pyarrow  # needed for parquet files
