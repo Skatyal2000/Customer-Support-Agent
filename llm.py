@@ -6,6 +6,7 @@ import requests
 from dotenv import load_dotenv
 import time 
 import json
+from time import perf_counter
 
 load_dotenv()
 

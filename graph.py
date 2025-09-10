@@ -3,9 +3,11 @@
 
 from langgraph.graph import StateGraph, END  # for making the graph
 from typing import TypedDict, List, Dict, Any  # for state schema types
+from time import perf_counter
 import re  # for regex simple checks
 import agent  # import the helper tools file (agent.py)
 import llm  # for the model call (compose step)
+import metrics
 
 AUTO_ESCALATE_ON = True       # turn auto-handoff on/off
 MAX_REPEAT_INTENT = 2         # how many repeated intents before handoff
@@ -54,11 +56,15 @@ def classify(state: GraphState) -> Dict[str, Any]:
 
 
 
-def retrieve(state): #RAG Search
-    q = state.get("input", "")  # query
-    order_hits = agent.rag_search(q, k=6)  # order/review search
-    kb_hits = agent.kb_search(q, k=6)  # kb search
-    return {"hits": order_hits, "kb_hits": kb_hits}  # store both
+def retrieve(state):
+    q = state.get("input", "")
+    t0 = perf_counter()  # start timer
+    order_hits = agent.rag_search(q, k=6)
+    kb_hits = agent.kb_search(q, k=6)
+    retrieve_ms = int((perf_counter() - t0) * 1000)  # ms
+    timings_prev = dict(state.get("timings", {}))  # keep old timings
+    timings_prev["retrieve_ms"] = retrieve_ms      # set retrieve time
+    return {"hits": order_hits, "kb_hits": kb_hits, "timings": timings_prev}
 
 
 
@@ -264,7 +270,11 @@ def compose(state: GraphState) -> Dict[str, Any]:
         if "retrieve_ms" in timings:
             try: timings["total_ms"] = int(timings.get("retrieve_ms", 0)) + int(gen_ms)
             except Exception: pass
-        return {"output": answer_text, "timings": timings}
+        checks = metrics.record_checks(answer_text, facts or {})   # returns dict of booleans
+        acc = metrics.grounding_score(checks)                      # float 0..1
+
+        # when returning:
+        return {"output": answer_text, "timings": timings, "accuracy": acc, "accuracy_checks": checks}
 
     # 3) ask for identifiers if still no facts
     if not facts:

@@ -29,27 +29,41 @@ def render_messages():
 
 def handle_user_message(user_text):
     # this function sends the user text to the agent and keeps the graph state
-    st.session_state.messages.append({"role": "user", "content": user_text})  # save user message
+    st.session_state.messages.append({"role": "user", "content": user_text})  # save user msg
     with st.chat_message("user"):
-        st.markdown(user_text)  # show user message
+        st.markdown(user_text)  # show user msg
 
     try:
-        # build the input state by merging previous state with the new input
         start_state = dict(st.session_state.graph_state)  # copy previous graph state
-        start_state["input"] = user_text  # set the new input
-        result = graph.APP.invoke(start_state)  # run the agent graph
+        start_state["input"] = user_text  # set new input
+        result = graph.APP.invoke(start_state)  # run graph
 
-        # update the stored graph state with new memory (if any)
+        # persist only memory across turns
         new_mem = result.get("memory", st.session_state.graph_state.get("memory", {}))  # read memory
-        st.session_state.graph_state = {"memory": new_mem}  # store back only memory
+        st.session_state.graph_state = {"memory": new_mem}  # store back memory
 
-        answer = result.get("output", "no response")  # get assistant answer text
+        answer = result.get("output", "no response")  # assistant text
+        timings = result.get("timings", {})  # timing dict (retrieve_ms, generation_ms, total_ms)
+        acc = result.get("accuracy", None)  # grounding score (float)
+        checks = result.get("accuracy_checks", {})  # which fields were present (dict)
     except Exception as e:
-        answer = f"Sorry, there was an error: {e}"  # fallback message on error
+        answer = f"Sorry, there was an error: {e}"  # fallback on error
+        timings, acc, checks = {}, None, {}
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})  # save assistant reply
+    st.session_state.messages.append({"role": "assistant", "content": answer})  # save reply
     with st.chat_message("assistant"):
-        st.markdown(answer)  # show assistant reply
+        st.markdown(answer)  # show reply
+
+        # details panel (latency + accuracy) under the reply
+        if timings or acc is not None or checks:
+            st.markdown("**Details (latency and accuracy)**")  # section title
+            if timings:
+                st.json({"Timings (ms)": timings})  # show timings
+            if acc is not None:
+                st.write(f"Grounding score: {acc}")  # show score
+            if checks:
+                st.json({"Checks": checks})  # show checks
+
 
 
 def main():
